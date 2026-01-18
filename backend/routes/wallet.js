@@ -148,6 +148,7 @@ router.post('/deposit', async (req, res) => {
       }
     })
   } catch (error) {
+    console.error('Deposit error:', error)
     res.status(500).json({ message: 'Error creating deposit', error: error.message })
   }
 })
