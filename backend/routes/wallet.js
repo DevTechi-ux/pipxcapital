@@ -29,7 +29,7 @@ router.get('/:userId', async (req, res) => {
 // POST /api/wallet/deposit - Create deposit request
 router.post('/deposit', async (req, res) => {
   try {
-    const { userId, amount, paymentMethod, transactionRef, screenshot } = req.body
+    const { userId, amount, paymentMethod, transactionRef, screenshot, localAmount, currency, currencySymbol, exchangeRate, markup } = req.body
 
     if (!amount || amount <= 0) {
       return res.status(400).json({ message: 'Invalid amount' })
@@ -103,6 +103,11 @@ router.post('/deposit', async (req, res) => {
       transactionRef,
       screenshot,
       status: 'Pending',
+      localAmount: localAmount || amount,
+      currency: currency || 'USD',
+      currencySymbol: currencySymbol || '$',
+      exchangeRate: exchangeRate || 1,
+      markup: markup || 0,
       bonusAmount,
       totalAmount: amount + bonusAmount,
       bonusId: applicableBonus?._id || null

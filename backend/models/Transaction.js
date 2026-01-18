@@ -97,6 +97,27 @@ const transactionSchema = new mongoose.Schema({
     type: mongoose.Schema.Types.ObjectId,
     ref: 'User'
   },
+  // Local currency fields
+  localAmount: {
+    type: Number,
+    default: 0
+  },
+  currency: {
+    type: String,
+    default: 'USD'
+  },
+  currencySymbol: {
+    type: String,
+    default: '$'
+  },
+  exchangeRate: {
+    type: Number,
+    default: 1
+  },
+  markup: {
+    type: Number,
+    default: 0
+  },
   // Bonus related fields
   bonusAmount: {
     type: Number,
