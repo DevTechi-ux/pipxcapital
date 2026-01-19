@@ -16,19 +16,34 @@ class MetaApiService {
     this.isConnected = false
     this.io = null
     
-    // Rate limiting - request queue
+    // AllTick WebSocket for real-time streaming
+    this.alltickToken = process.env.ALLTICK_API_TOKEN || '1b2b3ad1b5c8c28b9d956652ecb4111d-c-app'
+    this.alltickWs = null
+    this.alltickConnected = false
+    this.alltickReconnectAttempts = 0
+    this.maxReconnectAttempts = 10
+    
+    // Symbol mapping for AllTick
+    this.alltickSymbolMap = {
+      'XAUUSD': 'GOLD', 'XAGUSD': 'Silver',
+      'BTCUSD': 'BTCUSDT', 'ETHUSD': 'ETHUSDT'
+    }
+    
+    // Rate limiting - for fallback polling
     this.requestQueue = []
     this.isProcessingQueue = false
     this.lastRequestTime = 0
-    this.minRequestInterval = 1000 // 1 second between requests (1 req/sec to be safe)
+    this.minRequestInterval = 200
     this.rateLimitBackoff = 1
+    this.batchSize = 5
     
-    // Active symbols tracking - poll these more frequently
+    // Active symbols tracking
     this.activeSymbols = new Set()
     this.symbolLastRequested = new Map()
     
     console.log('MetaAPI: Token loaded:', this.token ? 'YES' : 'NO')
     console.log('MetaAPI: Account ID loaded:', this.accountId ? 'YES' : 'NO')
+    console.log('AllTick: Token loaded:', this.alltickToken ? 'YES' : 'NO')
   }
 
   setSocketIO(io) {
@@ -38,75 +53,267 @@ class MetaApiService {
   connect() {
     if (!this.token || !this.accountId) {
       console.error('MetaAPI: Missing METAAPI_TOKEN or METAAPI_ACCOUNT_ID in environment')
+    }
+
+    console.log('Starting real-time price streaming...')
+    this.isConnected = true
+    
+    // Use fast HTTP polling (AllTick WebSocket has subscription limits)
+    this.startFallbackPolling()
+  }
+
+  // AllTick WebSocket connection for instant real-time prices
+  connectAllTickWebSocket() {
+    if (this.alltickWs && this.alltickWs.readyState === WebSocket.OPEN) {
       return
     }
 
-    console.log('MetaAPI: Starting optimized price polling...')
-    this.isConnected = true
-    this.startPricePolling()
+    const wsUrl = `wss://quote.alltick.co/quote-b-ws-api?token=${this.alltickToken}`
+    console.log('AllTick: Connecting to WebSocket for real-time prices...')
+    
+    this.alltickWs = new WebSocket(wsUrl)
+    
+    this.alltickWs.on('open', () => {
+      console.log('AllTick: WebSocket connected - instant price updates enabled!')
+      this.alltickConnected = true
+      this.alltickReconnectAttempts = 0
+      
+      // Subscribe to all symbols
+      this.subscribeAllTickSymbols()
+      
+      // Start heartbeat to keep connection alive
+      this.startAllTickHeartbeat()
+    })
+    
+    this.alltickWs.on('message', (data) => {
+      try {
+        const message = JSON.parse(data.toString())
+        // Log all messages for debugging
+        if (message.cmd_id === 22999) {
+          console.log(`AllTick: Price update for ${message.data?.code}`)
+        } else {
+          console.log('AllTick: Received message cmd_id:', message.cmd_id, message.ret !== undefined ? `ret: ${message.ret}` : '')
+        }
+        this.handleAllTickMessage(message)
+      } catch (e) {
+        console.error('AllTick: Parse error:', e.message)
+      }
+    })
+    
+    this.alltickWs.on('error', (error) => {
+      console.error('AllTick: WebSocket error:', error.message)
+    })
+    
+    this.alltickWs.on('close', () => {
+      console.log('AllTick: WebSocket disconnected')
+      this.alltickConnected = false
+      this.stopAllTickHeartbeat()
+      
+      // Attempt reconnection
+      if (this.alltickReconnectAttempts < this.maxReconnectAttempts) {
+        this.alltickReconnectAttempts++
+        const delay = Math.min(1000 * this.alltickReconnectAttempts, 10000)
+        console.log(`AllTick: Reconnecting in ${delay}ms (attempt ${this.alltickReconnectAttempts})`)
+        setTimeout(() => this.connectAllTickWebSocket(), delay)
+      }
+    })
   }
 
-  startPricePolling() {
-    // Single polling loop - fetch one symbol at a time with proper delays
+  subscribeAllTickSymbols() {
+    if (!this.alltickWs || this.alltickWs.readyState !== WebSocket.OPEN) return
+    
+    const symbols = this.getDefaultSymbols()
+    const symbolList = symbols.map(symbol => ({
+      code: this.alltickSymbolMap[symbol] || symbol,
+      depth_level: 1
+    }))
+    
+    const subscribeMsg = {
+      cmd_id: 22002,
+      seq_id: Date.now(),
+      trace: `sub-${Date.now()}`,
+      data: {
+        symbol_list: symbolList
+      }
+    }
+    
+    this.alltickWs.send(JSON.stringify(subscribeMsg))
+    console.log(`AllTick: Subscribed to ${symbols.length} symbols for instant updates`)
+  }
+
+  handleAllTickMessage(message) {
+    // Handle price push (protocol 22999)
+    if (message.cmd_id === 22999 && message.data) {
+      const data = message.data
+      const alltickCode = data.code
+      
+      // Convert AllTick code back to our symbol
+      let symbol = alltickCode
+      for (const [ourSymbol, alltickSymbol] of Object.entries(this.alltickSymbolMap)) {
+        if (alltickSymbol === alltickCode) {
+          symbol = ourSymbol
+          break
+        }
+      }
+      
+      // Extract bid/ask prices
+      const bid = data.bids?.[0]?.price ? parseFloat(data.bids[0].price) : null
+      const ask = data.asks?.[0]?.price ? parseFloat(data.asks[0].price) : null
+      
+      if (bid && ask) {
+        const price = { bid, ask, time: Date.now() }
+        this.priceCache.set(symbol, price)
+        
+        // Emit instant update to all subscribers
+        if (this.io && this.subscribers.size > 0) {
+          this.io.to('prices').emit('priceStream', {
+            prices: this.getAllPrices(),
+            updated: { [symbol]: price },
+            timestamp: Date.now()
+          })
+        }
+      }
+    }
+    
+    // Handle subscription response (protocol 22003)
+    if (message.cmd_id === 22003) {
+      console.log('AllTick: Subscription confirmed')
+    }
+  }
+
+  startAllTickHeartbeat() {
+    this.stopAllTickHeartbeat()
+    
+    // Send heartbeat every 10 seconds to keep connection alive
+    this.alltickHeartbeatTimer = setInterval(() => {
+      if (this.alltickWs && this.alltickWs.readyState === WebSocket.OPEN) {
+        const heartbeat = {
+          cmd_id: 22000,
+          seq_id: Date.now(),
+          trace: `hb-${Date.now()}`,
+          data: {}
+        }
+        this.alltickWs.send(JSON.stringify(heartbeat))
+      }
+    }, 10000)
+  }
+
+  stopAllTickHeartbeat() {
+    if (this.alltickHeartbeatTimer) {
+      clearInterval(this.alltickHeartbeatTimer)
+      this.alltickHeartbeatTimer = null
+    }
+  }
+
+  // Fast polling as primary price source
+  startFallbackPolling() {
     this.pollIndex = 0
     this.pollSymbols = this.getDefaultSymbols()
+    this.batchSize = 8 // Fetch 8 symbols per batch for faster updates
     
-    // Poll one symbol every 5 seconds (12 requests per minute = very conservative)
+    // Poll every 500ms for near real-time updates
     this.pollTimer = setInterval(() => {
-      this.pollNextSymbol()
-    }, 5000)
+      this.pollNextBatch()
+    }, 500)
     
-    // Initial fetch after 10 seconds to let any rate limits clear
-    setTimeout(() => this.pollNextSymbol(), 10000)
+    // Initial fetch immediately
+    this.pollNextBatch()
     
-    console.log(`MetaAPI: Will poll ${this.pollSymbols.length} symbols (one every 5 seconds)`)
+    console.log(`MetaAPI: Fast polling ${this.pollSymbols.length} symbols (batch of ${this.batchSize} every 500ms)`)
   }
 
-  async pollNextSymbol() {
+  async pollNextBatch() {
     if (this.rateLimitBackoff > 1) {
-      // If we're in backoff, wait longer
-      console.log(`MetaAPI: In backoff mode (${this.rateLimitBackoff}x), skipping poll`)
       this.rateLimitBackoff = Math.max(1, this.rateLimitBackoff - 0.5)
       return
     }
     
-    const symbol = this.pollSymbols[this.pollIndex]
-    this.pollIndex = (this.pollIndex + 1) % this.pollSymbols.length
+    // Get next batch of symbols
+    const batch = []
+    for (let i = 0; i < this.batchSize; i++) {
+      batch.push(this.pollSymbols[this.pollIndex])
+      this.pollIndex = (this.pollIndex + 1) % this.pollSymbols.length
+    }
     
-    const price = await this.fetchPriceWithRateLimit(symbol)
+    // Fetch all symbols in batch concurrently
+    const results = await Promise.allSettled(
+      batch.map(symbol => this.fetchPriceWithRateLimit(symbol))
+    )
     
-    if (price && this.io && this.subscribers.size > 0) {
-      this.io.to('prices').emit('priceUpdate', { symbol, price })
+    const updated = {}
+    results.forEach((result, index) => {
+      if (result.status === 'fulfilled' && result.value) {
+        updated[batch[index]] = result.value
+      }
+    })
+    
+    // Emit updates if we have subscribers and got prices
+    if (Object.keys(updated).length > 0 && this.io && this.subscribers.size > 0) {
       this.io.to('prices').emit('priceStream', {
         prices: this.getAllPrices(),
-        updated: { [symbol]: price },
+        updated,
         timestamp: Date.now()
       })
     }
   }
 
-  // Fetch price with rate limit handling
+  // Fetch price using AllTick HTTP API (faster, no rate limits)
   async fetchPriceWithRateLimit(symbol) {
     try {
       this.lastRequestTime = Date.now()
       this.symbolLastRequested.set(symbol, Date.now())
       
+      // Use AllTick API for faster updates
+      const alltickCode = this.alltickSymbolMap[symbol] || symbol
+      const query = {
+        trace: `poll-${Date.now()}`,
+        data: { symbol_list: [{ code: alltickCode }] }
+      }
+      const encodedQuery = encodeURIComponent(JSON.stringify(query))
+      const url = `https://quote.alltick.co/quote-b-api/depth-tick?token=${this.alltickToken}&query=${encodedQuery}`
+      
+      const response = await fetch(url)
+      
+      if (!response.ok) {
+        // Fallback to MetaAPI if AllTick fails
+        return this.fetchPriceFromMetaApi(symbol)
+      }
+      
+      const data = await response.json()
+      if (data.ret === 200 && data.data?.tick_list?.[0]) {
+        const tick = data.data.tick_list[0]
+        const bid = tick.bids?.[0]?.price ? parseFloat(tick.bids[0].price) : null
+        const ask = tick.asks?.[0]?.price ? parseFloat(tick.asks[0].price) : null
+        
+        if (bid && ask) {
+          const price = { bid, ask, time: Date.now() }
+          this.priceCache.set(symbol, price)
+          return price
+        }
+      }
+      
+      // Fallback to MetaAPI
+      return this.fetchPriceFromMetaApi(symbol)
+    } catch (error) {
+      // Fallback to MetaAPI on error
+      return this.fetchPriceFromMetaApi(symbol)
+    }
+  }
+  
+  // Fallback to MetaAPI
+  async fetchPriceFromMetaApi(symbol) {
+    try {
       const url = `https://mt-client-api-v1.london.agiliumtrade.ai/users/current/accounts/${this.accountId}/symbols/${symbol}/current-price`
       const response = await fetch(url, {
         headers: { 'auth-token': this.token }
       })
       
       if (response.status === 429) {
-        // Rate limited - increase backoff significantly
         this.rateLimitBackoff = Math.min(this.rateLimitBackoff + 2, 10)
-        console.log(`MetaAPI: Rate limited on ${symbol}, backoff now ${this.rateLimitBackoff}x`)
         return null
       }
       
-      if (!response.ok) {
-        console.log(`MetaAPI: Error fetching ${symbol}: HTTP ${response.status}`)
-        return null
-      }
+      if (!response.ok) return null
       
       const data = await response.json()
       if (data.bid && data.ask) {
@@ -116,7 +323,6 @@ class MetaApiService {
       }
       return null
     } catch (error) {
-      console.log(`MetaAPI: Error fetching ${symbol}:`, error.message)
       return null
     }
   }
@@ -127,6 +333,15 @@ class MetaApiService {
   }
 
   disconnect() {
+    // Disconnect AllTick WebSocket
+    if (this.alltickWs) {
+      this.stopAllTickHeartbeat()
+      this.alltickWs.close()
+      this.alltickWs = null
+      this.alltickConnected = false
+    }
+    
+    // Stop fallback polling
     if (this.pollTimer) {
       clearInterval(this.pollTimer)
       this.pollTimer = null

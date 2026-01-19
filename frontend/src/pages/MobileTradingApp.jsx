@@ -5,15 +5,17 @@ import {
   Copy, Users, HelpCircle, FileText, UserCircle, LogOut, Wallet,
   X, ChevronRight, Search, Star, ArrowUp, ArrowDown, Clock,
   Plus, Minus, Settings, RefreshCw, ChevronDown, Bell, User,
-  ArrowDownCircle, ArrowUpCircle, Check, Pencil, Trash2
+  ArrowDownCircle, ArrowUpCircle, Check, Pencil, Trash2, Sun, Moon
 } from 'lucide-react'
 import metaApiService from '../services/metaApi'
 import priceStreamService from '../services/priceStream'
+import { useTheme } from '../context/ThemeContext'
 import { API_URL } from '../config/api'
 
 const MobileTradingApp = () => {
   const navigate = useNavigate()
   const [searchParams] = useSearchParams()
+  const { isDarkMode, toggleDarkMode, modeColors } = useTheme()
   const accountIdFromUrl = searchParams.get('account')
   const [activeTab, setActiveTab] = useState(accountIdFromUrl ? 'trade' : 'home')
   const [showMoreMenu, setShowMoreMenu] = useState(false)
@@ -1634,6 +1636,22 @@ const MobileTradingApp = () => {
               </div>
               
               <div className="space-y-1">
+                {/* Dark Mode Toggle */}
+                <button
+                  onClick={toggleDarkMode}
+                  className="w-full flex items-center justify-between p-4 rounded-xl hover:bg-dark-700"
+                >
+                  <div className="flex items-center gap-4">
+                    <div className="w-10 h-10 bg-dark-700 rounded-full flex items-center justify-center">
+                      {isDarkMode ? <Moon size={20} className="text-blue-400" /> : <Sun size={20} className="text-yellow-400" />}
+                    </div>
+                    <span className="text-white font-medium">{isDarkMode ? 'Dark Mode' : 'Light Mode'}</span>
+                  </div>
+                  <div className={`w-12 h-7 rounded-full p-1 transition-colors ${isDarkMode ? 'bg-blue-500' : 'bg-gray-600'}`}>
+                    <div className={`w-5 h-5 bg-white rounded-full transition-transform ${isDarkMode ? 'translate-x-5' : 'translate-x-0'}`} />
+                  </div>
+                </button>
+
                 {moreMenuItems.map((item) => (
                   <button
                     key={item.name}
