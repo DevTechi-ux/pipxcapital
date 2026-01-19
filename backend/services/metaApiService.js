@@ -16,6 +16,17 @@ class MetaApiService {
     this.isConnected = false
     this.io = null
     
+    // Rate limiting - request queue
+    this.requestQueue = []
+    this.isProcessingQueue = false
+    this.lastRequestTime = 0
+    this.minRequestInterval = 1000 // 1 second between requests (1 req/sec to be safe)
+    this.rateLimitBackoff = 1
+    
+    // Active symbols tracking - poll these more frequently
+    this.activeSymbols = new Set()
+    this.symbolLastRequested = new Map()
+    
     console.log('MetaAPI: Token loaded:', this.token ? 'YES' : 'NO')
     console.log('MetaAPI: Account ID loaded:', this.accountId ? 'YES' : 'NO')
   }
@@ -30,70 +41,70 @@ class MetaApiService {
       return
     }
 
-    // Use REST API polling instead of WebSocket for simplicity
-    console.log('MetaAPI: Starting price polling...')
+    console.log('MetaAPI: Starting optimized price polling...')
     this.isConnected = true
     this.startPricePolling()
   }
 
   startPricePolling() {
-    // Poll prices every 5 seconds to avoid rate limits
-    this.pollPrices()
-    this.pollingTimer = setInterval(() => {
-      this.pollPrices()
+    // Single polling loop - fetch one symbol at a time with proper delays
+    this.pollIndex = 0
+    this.pollSymbols = this.getDefaultSymbols()
+    
+    // Poll one symbol every 5 seconds (12 requests per minute = very conservative)
+    this.pollTimer = setInterval(() => {
+      this.pollNextSymbol()
     }, 5000)
+    
+    // Initial fetch after 10 seconds to let any rate limits clear
+    setTimeout(() => this.pollNextSymbol(), 10000)
+    
+    console.log(`MetaAPI: Will poll ${this.pollSymbols.length} symbols (one every 5 seconds)`)
   }
 
-  async pollPrices() {
-    const symbols = this.getDefaultSymbols()
-    let fetchedCount = 0
-    
-    // Fetch one symbol at a time with delay to avoid rate limits
-    for (let i = 0; i < symbols.length; i++) {
-      const symbol = symbols[i]
-      try {
-        const price = await this.fetchPriceQuiet(symbol)
-        if (price) {
-          fetchedCount++
-          if (this.io && this.subscribers.size > 0) {
-            this.io.to('prices').emit('priceUpdate', { symbol, price })
-          }
-        }
-      } catch (e) {
-        // Ignore individual symbol errors
-      }
-      
-      // Add 500ms delay between requests to avoid rate limiting
-      if (i < symbols.length - 1) {
-        await new Promise(r => setTimeout(r, 500))
-      }
+  async pollNextSymbol() {
+    if (this.rateLimitBackoff > 1) {
+      // If we're in backoff, wait longer
+      console.log(`MetaAPI: In backoff mode (${this.rateLimitBackoff}x), skipping poll`)
+      this.rateLimitBackoff = Math.max(1, this.rateLimitBackoff - 0.5)
+      return
     }
     
-    if (fetchedCount > 0) {
-      console.log(`MetaAPI: Fetched ${fetchedCount}/${symbols.length} prices`)
-    }
+    const symbol = this.pollSymbols[this.pollIndex]
+    this.pollIndex = (this.pollIndex + 1) % this.pollSymbols.length
     
-    // Broadcast full price stream
-    if (this.io && this.subscribers.size > 0) {
+    const price = await this.fetchPriceWithRateLimit(symbol)
+    
+    if (price && this.io && this.subscribers.size > 0) {
+      this.io.to('prices').emit('priceUpdate', { symbol, price })
       this.io.to('prices').emit('priceStream', {
         prices: this.getAllPrices(),
-        updated: {},
+        updated: { [symbol]: price },
         timestamp: Date.now()
       })
     }
   }
-  
-  // Quiet version that doesn't log errors (for polling)
-  async fetchPriceQuiet(symbol) {
+
+  // Fetch price with rate limit handling
+  async fetchPriceWithRateLimit(symbol) {
     try {
+      this.lastRequestTime = Date.now()
+      this.symbolLastRequested.set(symbol, Date.now())
+      
       const url = `https://mt-client-api-v1.london.agiliumtrade.ai/users/current/accounts/${this.accountId}/symbols/${symbol}/current-price`
       const response = await fetch(url, {
-        headers: {
-          'auth-token': this.token
-        }
+        headers: { 'auth-token': this.token }
       })
       
+      if (response.status === 429) {
+        // Rate limited - increase backoff significantly
+        this.rateLimitBackoff = Math.min(this.rateLimitBackoff + 2, 10)
+        console.log(`MetaAPI: Rate limited on ${symbol}, backoff now ${this.rateLimitBackoff}x`)
+        return null
+      }
+      
       if (!response.ok) {
+        console.log(`MetaAPI: Error fetching ${symbol}: HTTP ${response.status}`)
         return null
       }
       
@@ -105,14 +116,20 @@ class MetaApiService {
       }
       return null
     } catch (error) {
+      console.log(`MetaAPI: Error fetching ${symbol}:`, error.message)
       return null
     }
   }
+  
+  // Returns cached price or null
+  async fetchPriceQuiet(symbol) {
+    return this.priceCache.get(symbol) || null
+  }
 
   disconnect() {
-    if (this.pollingTimer) {
-      clearInterval(this.pollingTimer)
-      this.pollingTimer = null
+    if (this.pollTimer) {
+      clearInterval(this.pollTimer)
+      this.pollTimer = null
     }
     this.isConnected = false
   }
